@@ -16,9 +16,6 @@ from plot import plot
 
 from utils.buffers import CircularBuffer
 
-from PIL import Image
-import cv2
-
 # TODO Default_joint
 default_joint_angles = {
             'FL_hip_joint': 0.1,   # [rad] LF_HAA
