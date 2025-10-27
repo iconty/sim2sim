@@ -580,8 +580,8 @@ def joy_loop():
 # 这里是main函数
 if __name__ == '__main__':
     # 注意这里加载的是policy，不是model
-    path = f'pretrian_policy/policy_g1_him.pt'
-    if path == f'pretrian_policy/policy_g1_him.pt':
+    path = f'pre-trian_policy/policy_g1_him.pt'
+    if path == f'pre-trian_policy/policy_g1_him.pt':
         policy_class = "g1_dof12"
     else:
         policy_class = "g1"

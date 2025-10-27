@@ -723,9 +723,9 @@ def joy_loop():
 
 # 这里是main函数
 if __name__ == '__main__':
-    #TODO Policy address
-    path = f'pretrian_policy/policy.pt'
-    if path == f'pretrian_policy/policy.pt':
+    #TODO Policy path
+    path = f'pre-trian_policy/policy.pt'
+    if path == f'pre-trian_policy/policy.pt':
         policy_class = "ac2_roa"
     else:
         policy_class = "ac2_amp"

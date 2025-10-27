@@ -670,9 +670,9 @@ def joy_loop():
 
 # 这里是main函数
 if __name__ == '__main__':
-    #TODO Policy address
-    path = f'pretrian_policy/amp_vae_v4.pt'
-    if path == f'pretrian_policy/amp_vae_v4.pt':
+    #TODO Policy path
+    path = f'pre-trian_policy/amp_vae_v4.pt'
+    if path == f'pre-trian_policy/amp_vae_v4.pt':
         policy_class = "go2_vae"
     else:
         policy_class = "go2_amp"
