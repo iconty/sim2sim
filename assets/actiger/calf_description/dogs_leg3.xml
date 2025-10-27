@@ -1,0 +1,61 @@
+<mujoco model="dogs_leg3">
+  <compiler angle="radian"/>
+
+  <default>
+    <default class="visual">
+          <geom type="mesh" contype="0" conaffinity="0" group="2" material="dark"/>
+    </default>
+  </default>
+
+  <asset>
+    <material name="dark" specular="0" shininess="0.25" rgba="0.2 0.2 0.2 1"/>
+    <mesh name="Base_Thigh_Link" file="Base_Thigh_Link.STL"/>
+    <mesh name="Screw_Link" file="Screw_Link.STL"/>
+    <mesh name="Motor_Link" file="Motor_Link.STL"/>
+    <mesh name="Slider_Link" file="Slider_Link.STL"/>
+    <mesh name="Calf_Link" file="Calf_Link.STL"/>
+  </asset>
+
+  <worldbody>
+    <body name="thigh" pos="0 0 1.0" euler="-1.57 0 0">
+      <inertial pos="-0.01120994 0.01737932 -0.07805274" quat="0 0 0 1" mass="0.42961005" diaginertia="0.00287909 0.00300220 0.00047530"/>
+      <geom class="visual" type="mesh" rgba="1 1 1 1" mesh="Base_Thigh_Link"/>
+
+      <body name="Screw_Link" pos="0.0036992 0 0.015567">
+        <inertial pos="0.00443604 0.00030836 -0.0369051" quat="0.916459 -0.141712 0.18449 -0.325552" mass="0.288085" diaginertia="0.000108267 0.000106888 9.56443e-05"/>
+        <joint name="Screw_Joint" pos="0 0 0" axis="0 -1 0" damping="0.0"/>
+        <geom class="visual" type="mesh" rgba="1 1 1 1" mesh="Screw_Link"/>
+        <body name="Motor_Link" pos="0.0057514 0 -0.057875" quat="0.998774 0 -0.0495058 0">
+          <!-- 0.00011306 -->
+          <inertial pos="0 0 -0.0108673" mass="0.306584" diaginertia="0.00059404 0.00059404 0.0001"/>
+          <!-- -76.1687554 -38.0843777-->
+          <joint name="Motor_Joint" pos="0 0 0" axis="0 0 -1" ref="-38.0843777" damping="0.0" armature="0.0" frictionloss="0.0"/> 
+          <geom class="visual" type="mesh" rgba="1 1 1 1" mesh="Motor_Link"/>
+        </body>
+        <body name="Slider_Link" pos="0.007288 0 -0.073337" quat="0.998774 0 -0.0495058 0">
+          <inertial pos="0 0 -0.0435849" mass="0.213655" diaginertia="0.00036423 0.00036423 1.667e-05"/>
+          <joint name="Slider_Joint" pos="0 0 0" axis="0 0 -1" type="slide" damping="0.0" armature="0.0" frictionloss="0.0"/>
+          <geom class="visual" type="mesh" rgba="1 1 1 1" mesh="Slider_Link" />
+          <site name="Slider_Down_Link" pos="0.0 0 -0.134" euler="0 0 0.0"/>
+        </body>
+      </body>
+      <body name="Calf_Link" pos="0 0 -0.246">
+        <inertial pos="0.00904603 0 -0.104525" quat="0.707078 0.00618415 0.00618202 0.707082" mass="0.22" diaginertia="0.00343091 0.00339973 5.57373e-05"/>
+        <joint name="Calf_Joint" pos="0 0 0" axis="0 1 0" damping="0." armature="0.0" range="-2.69653 -0.916298"/> <!-- armature is 0.23 -->
+        <geom class="visual" type="mesh" rgba="1 1 1 1" mesh="Calf_Link"/>
+        <site name="Calf_Up_Link" pos="0.024238 0 0.054886" euler="0 0 0.016031"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="Motor_Joint" joint="Motor_Joint" ctrllimited="true" ctrlrange="-2.5 2.5" />
+    <motor name="Calf_Joint" joint="Calf_Joint" ctrllimited="true" ctrlrange="-100 100" />
+  </actuator>
+
+  <equality>
+      <!-- <connect name="c1" site1="Slider_Down_Link" site2="Calf_Up_Link" solimp="0.999 0.9999 0.001 0.1 2"/> -->
+      <!-- 785.3981 392.69905 -->
+      <joint name="j1" joint1="Motor_Joint" joint2="Slider_Joint" polycoef="0 392.69905 0 0"/>
+  </equality>
+</mujoco>

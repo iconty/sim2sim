@@ -1,0 +1,6 @@
+./isaaclab.sh -p scripts/tools/convert_urdf.py \
+  /home/liuyun/robot_model/urdf/ac2_coli.urdf \
+  /home/liuyun/robot_model/usd/ac2_coli.usd \
+  --joint-stiffness 0.0 \
+  --joint-damping 0.0 \
+  --joint-target-type none
