@@ -13,13 +13,14 @@ We test our codes under the following environment:
 - PyTorch 2.7.0 build for CUDA 12.8
 
 1. Create an environment and install PyTorch:
+
    If you don't have any conda env or you wanna create a new env for mujco, then
 
    * `conda activate rl_mujoco`
    * `conda create -n rl_mujoco python=3.10`
    * `pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128`
 
-   **Recommend:** If there exists a conda env, then install legged_mujoco straightly, make sure your python version >= 3.8
+   **Recommend:** If there exists a conda env, then install legged_mujoco straightly, make sure your python version >= 3.8, and installed pytorch
 2. Install legged_mujoco
 
    * `pip install -e .`
