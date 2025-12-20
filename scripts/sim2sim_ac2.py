@@ -16,12 +16,102 @@ from plot import plot
 
 from utils.buffers import CircularBuffer
 
+from enum import Enum, auto
+
+class StandState(Enum):
+    IDLE = auto()
+    PRE_STAND = auto()
+    FULL_STAND = auto()
+    PRE_CROUCH = auto()
+    CROUCH = auto()
+    STAND_DONE = auto()
+
+
+class StandFSM:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state = StandState.IDLE
+        self.timer = 0.0
+        self.start_pos = None
+
+    def reset(self):
+        self.state = StandState.IDLE
+        self.timer = 0.0
+        self.start_pos = None
+
+    def _interpolate_motion(self, target_pos, q, dq, data, pd_control,
+                            p_gain=100, d_gain=2, speed=1.0):
+        """线性插值过渡 + PD 控制"""
+        dt = self.cfg.sim_config.dt
+        tau_limit = self.cfg.robot_config.tau_limit
+        num_actions = self.cfg.sim_config.num_actions
+
+        self.timer += dt / speed
+        alpha = min(self.timer, 1.0)
+
+        target_q = target_pos * alpha + self.start_pos * (1 - alpha)
+        target_dq = np.zeros(num_actions)
+        tau = pd_control(target_q, q, p_gain, target_dq, dq, d_gain)
+        tau = np.clip(tau, -tau_limit, tau_limit)
+        data.ctrl[:12] = tau
+        plot(target_q, "target_stand_pos")
+
+        return alpha >= 1.0  # 返回是否完成过渡
+
+    def update(self, q, dq, data, pd_control,
+               stable_pos, default_pos, crouch_pos,
+               pre_stand=False, full_stand=False, pre_crouch=False, crouch=False):
+        """
+        参数:
+        - q, dq: 当前状态
+        - data.ctrl: 输出控制命令
+        - stable_pos, default_pos, pre_crouch_pos, crouch_pos: 姿态目标
+        """
+        done = False
+
+        # --- 状态逻辑 ---
+        if self.state == StandState.IDLE:
+            if pre_stand:
+                self.state = StandState.PRE_STAND
+                self.timer = 0.0
+                self.start_pos = q.copy()
+
+        elif self.state == StandState.PRE_STAND:
+            if self._interpolate_motion(stable_pos, q, dq, data, pd_control, speed=1.5):
+                if full_stand:
+                    self.state = StandState.FULL_STAND
+                    self.timer = 0.0
+                    self.start_pos = q.copy()
+
+        elif self.state == StandState.FULL_STAND:
+            if self._interpolate_motion(default_pos, q, dq, data, pd_control, speed=3.0):
+                if pre_crouch:
+                    self.state = StandState.PRE_CROUCH
+                    self.timer = 0.0
+                    self.start_pos = q.copy()
+
+        elif self.state == StandState.PRE_CROUCH:
+            if self._interpolate_motion(stable_pos, q, dq, data, pd_control, speed=3.0):
+                if crouch:
+                    self.state = StandState.CROUCH
+                    self.timer = 0.0
+                    self.start_pos = q.copy()
+
+        elif self.state == StandState.CROUCH:
+            if self._interpolate_motion(crouch_pos, q, dq, data, pd_control, speed=1.5):
+                pass
+
+        return self.state, done
+
+
+
+
 # TODO Default_joint
 default_joint_angles = {
-            'FL_hip_joint': -0.0,   # [rad] LF_HAA
-            'RL_hip_joint': -0.0,   # [rad] LH_HAA
-            'FR_hip_joint': 0.0 ,  # [rad] RF_HAA
-            'RR_hip_joint': 0.0,   # [rad] RH_HAA
+            'FL_hip_joint': -0.1,   # [rad] LF_HAA
+            'RL_hip_joint': -0.1,   # [rad] LH_HAA
+            'FR_hip_joint': 0.1 ,  # [rad] RF_HAA
+            'RR_hip_joint': 0.1,   # [rad] RH_HAA
 
             'FL_thigh_joint': 0.9,   # [rad] LF_HFE 
             'RL_thigh_joint': 0.9,   # [rad] LH_HFE
@@ -35,20 +125,37 @@ default_joint_angles = {
         }
 
 stable_joint_angles = {
-            'FL_hip_joint': -0.0219698,   # [rad] LF_HAA
-            'RL_hip_joint': 0.0852241,   # [rad] LH_HAA
-            'FR_hip_joint': -0.048603 ,  # [rad] RF_HAA
-            'RR_hip_joint': -0.010456,   # [rad] RH_HAA
+            'FL_hip_joint': -0.0,   # [rad] LF_HAA
+            'RL_hip_joint': -0.0,   # [rad] LH_HAA
+            'FR_hip_joint': 0.0 ,  # [rad] RF_HAA
+            'RR_hip_joint': 0.0,   # [rad] RH_HAA
 
-            'FL_thigh_joint': 0.880923,   # [rad] LF_HFE 
-            'RL_thigh_joint': 0.919451,   # [rad] LH_HFE
-            'FR_thigh_joint': 0.85193,   # [rad] RF_HFE
-            'RR_thigh_joint': 0.874819,   # [rad] RH_HFE
+            'FL_thigh_joint': 1.3,   # [rad] LF_HFE 
+            'RL_thigh_joint': 1.3,   # [rad] LH_HFE
+            'FR_thigh_joint': 1.3,   # [rad] RF_HFE
+            'RR_thigh_joint': 1.3,   # [rad] RH_HFE
 
-            'FL_calf_joint': -1.56318,   # [rad] LF_KFE
-            'RL_calf_joint': -1.63017,   # [rad] LH_KFE
-            'FR_calf_joint': -1.64577,   # [rad] RF_KFE
-            'RR_calf_joint': -1.5879,   # [rad] RH_KFE
+            'FL_calf_joint': -2.64,   # [rad] LF_KFE
+            'RL_calf_joint': -2.64,   # [rad] LH_KFE
+            'FR_calf_joint': -2.64,   # [rad] RF_KFE
+            'RR_calf_joint': -2.64,   # [rad] RH_KFE
+        }
+
+lay_down_joint_angles = {
+            'FL_hip_joint': 0.635,   # [rad] LF_HAA
+            'RL_hip_joint': 0.635,   # [rad] LH_HAA
+            'FR_hip_joint': -0.635 ,  # [rad] RF_HAA
+            'RR_hip_joint': -0.635,   # [rad] RH_HAA
+
+            'FL_thigh_joint': 1.09,   # [rad] LF_HFE 
+            'RL_thigh_joint': 1.09,   # [rad] LH_HFE
+            'FR_thigh_joint': 1.09,   # [rad] RF_HFE
+            'RR_thigh_joint': 1.09,   # [rad] RH_HFE
+
+            'FL_calf_joint': -2.7,   # [rad] LF_KFE
+            'RL_calf_joint': -2.7,   # [rad] LH_KFE
+            'FR_calf_joint': -2.7,   # [rad] RF_KFE
+            'RR_calf_joint': -2.7,   # [rad] RH_KFE
         }
 
 joint_names = [
@@ -72,7 +179,10 @@ one_step = False
 action_at = True
 done = False
 disable_mode = False
-disturbance = False
+pre_stand = False
+full_stand = False
+pre_crouch = False
+crouch = False
 hangup = False
 reset = False
 
@@ -137,12 +247,20 @@ def key_callback(keycode):
         disable_mode = not disable_mode
 
     if keycode == 322:
-        global disturbance
-        disturbance = not disturbance
+        global pre_stand
+        pre_stand = not pre_stand
 
     if keycode == 323:
-        global hangup
-        hangup = not hangup
+        global full_stand
+        full_stand = not full_stand
+
+    if keycode == 324:
+        global pre_crouch
+        pre_crouch = not pre_crouch
+
+    if keycode == 325:
+        global crouch
+        crouch = not crouch
 
     if keycode == 334:
         global one_step
@@ -184,40 +302,6 @@ class ObsBuffer:
 
         # 正常返回指定延迟步的值
         return self.buffer[-n_steps - 1]
-
-class StepFrequencyTracker:
-    def __init__(self, window_size: int = 200, dt: float = 0.005):
-        """
-        初始化步频跟踪器
-        Args:
-            window_size: 保存多少帧的历史（如 100 帧）
-            dt: 时间步长（每帧的间隔，单位：秒）
-        """
-        self.dt = dt
-        self.buffer = deque(maxlen=window_size)
-        self.T = window_size
-
-    def update(self, foot_contact: np.ndarray):
-        """
-        添加当前一帧的 foot_contact 状态
-        Args:
-            foot_contact: shape=(4,), float 或 bool 数组
-        """
-        assert foot_contact.shape == (4,)
-        self.buffer.append(foot_contact.astype(np.uint8))
-
-    def get_step_frequency(self) -> np.ndarray:
-        if len(self.buffer) < 2:
-            return np.zeros(4)
-
-        buffer_array = np.stack(self.buffer, axis=0).astype(np.float32)  # ✅ 确保类型
-        transitions = np.abs(np.diff(buffer_array, axis=0))  # (T-1, 4)
-        transition_count = np.sum(transitions, axis=0)
-
-        window_time = self.dt * (len(self.buffer) - 1)
-        step_freq = (transition_count / 2.0) / window_time  # Hz
-
-        return step_freq
 
 @torch.jit.script
 def quat_rotate_inverse(q, v):
@@ -317,21 +401,8 @@ def get_obs(data, model):
     
     foot_contact, foot_forces = get_foot_contact(data, model)
 
-    q_noise = 0.01
-    dq_noise = 0.2
-    omega_noise = 0.0
-    gvec_noise = 0.05
+    obs_delay = q, dq, quat, v, omega, gvec
 
-    # # 添加噪声（只加到腿部部分）
-    # q[-12:] += np.random.uniform(-1, 1, size=(12,)) * q_noise
-    # dq[-12:] += np.random.uniform(-1, 1, size=(12,)) * dq_noise
-    # omega += np.random.uniform(-1, 1, size=(3,)) * omega_noise
-    # gvec += np.random.uniform(-1, 1, size=(3,)) * gvec_noise
-
-    obs_buffer.add((q, dq, quat, v, omega, gvec))
-
-    obs_delay = obs_buffer.get_delayed_value(0.002)
-    # return (q, dq, quat, v, omega, gvec)
     return obs_delay, foot_contact, foot_forces
 
 def pd_control(target_q, q, kp, target_dq, dq, kd):
@@ -351,10 +422,7 @@ class Sim2simCfg():
     class robot_config:
         kps = np.array([40.0]*12, dtype=np.double)
         kds = np.array([1.0]*12, dtype=np.double)
-        # kps = np.array([60.0]*12, dtype=np.double)
-        # kds = np.array([1.5]*12, dtype=np.double)
         tau_limit = 60. * np.ones(12, dtype=np.double)
-        # kps[[2, 5, 8, 11]] = 60.0
 
 # 常量定义
 LEAD = 0.008
@@ -397,64 +465,7 @@ def calc_jacobian(motor_pos):
     J1 = (DOUBLE_L1_L2_MUL / 2.0) * np.sin(Inner_Angle) / Screw_Len
     return J1, KneeAngle_rad
 
-class SimpleNavigator:
-    def __init__(self, goal_x, goal_y):
-        self.goal_x = goal_x
-        self.goal_y = goal_y
-
-        # 控制参数
-        self.k_v = 1.0         # 前向速度比例增益
-        self.k_w = 6.5        # 角速度比例增益
-        self.k_vy = 0.0        # 横向修正速度增益
-        self.stop_radius = 0.1
-
-        # 最大速度限制
-        self.max_v = 2.0
-        self.max_vy = 0.5
-        self.max_w = 1.0
-
-    def compute_command(self, pos_x, pos_y, yaw):
-        dx = self.goal_x - pos_x
-        dy = self.goal_y - pos_y
-
-        distance = math.hypot(dx, dy)
-        target_yaw = math.atan2(dy, dx)
-
-        yaw_error = (target_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
-
-        local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
-        local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
-
-        if distance < self.stop_radius:
-            v = 0.0
-            vy = 0.0
-            w = 0.0
-        else:
-            # --- 角度衰减控制因子 ---
-            yaw_factor = math.exp(-1 * abs(yaw_error))  # 抑制未对准时的前进速度
-
-            # --- 综合速度控制 ---
-            v = self.k_v * local_x
-            vy = self.k_vy * local_y
-            w = self.k_w * math.tanh(2.0 * yaw_error)  # 非线性角度响应
-
-            # 限速处理
-            v = max(-self.max_v, min(self.max_v, v))
-            vy = max(-self.max_vy, min(self.max_vy, vy))
-            w = max(-self.max_w, min(self.max_w, w))
-
-            if abs(w) < 0.1:
-                w = 0.0
-
-            if abs(v) < 0.1:
-                v = 0.0
-
-            # v *= yaw_factor
-
-        return v, vy, w
-
-
-def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
+def run_mujoco(policy, cfg: Sim2simCfg):
     """
     Run the Mujoco simulation using the provided policy and configuration.
 
@@ -477,6 +488,8 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
 
     stable_pos = np.zeros(cfg.sim_config.num_actions, dtype=np.double)
 
+    crouch_pos = np.zeros(cfg.sim_config.num_actions, dtype=np.double)
+
     # 使用循环进行简化
     for i, leg in enumerate(['FL', 'FR', 'RL', 'RR']):
         default_pos[3*i:3*i+3] = [default_joint_angles[f'{leg}_hip_joint'],
@@ -485,21 +498,22 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
         stable_pos[3*i:3*i+3] = [stable_joint_angles[f'{leg}_hip_joint'],
                                 stable_joint_angles[f'{leg}_thigh_joint'],
                                 stable_joint_angles[f'{leg}_calf_joint']]
+        crouch_pos[3*i:3*i+3] = [lay_down_joint_angles[f'{leg}_hip_joint'],
+                                lay_down_joint_angles[f'{leg}_thigh_joint'],
+                                lay_down_joint_angles[f'{leg}_calf_joint']]
+        
 
     data.qpos[-12:] = default_pos
     data.qpos[2] = 0.45
 
     target_q = default_pos_re.copy()
 
+    target_dq = np.zeros((cfg.sim_config.num_actions), dtype=np.double)
+
     #TODO Observations_list
     observations_list = ["commands", "ang_vel_body", "gravity_vec", "dof_pos", "dof_vel", "actions"]
-    # observations_list = ["gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]
 
     count_lowlevel = 0
-
-    tracker = StepFrequencyTracker(window_size=200, dt=cfg.sim_config.dt)
-
-    navigator = SimpleNavigator(goal_x=42.0, goal_y=0.0)
 
     obs_history = CircularBuffer(max_len=6, batch_size=1, device=device)
 
@@ -508,20 +522,19 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
     if (len(observations_list) == 6):
         actor_obs = torch.zeros((1, 45), dtype=torch.float32, device=device)
     
-    motor_pos = np.zeros(4, dtype=np.double)
-    motor_vel = np.zeros(4, dtype=np.double)
-    calf_pos_jaco = np.zeros(4, dtype=np.double)
-    cafl_vel_jaco = np.zeros(4, dtype=np.double)
-    cafl_tau_jaco = np.zeros(4, dtype=np.double)
     command = np.zeros(3, dtype=np.double)
     # 重置 circular buffer 并写入历史帧
     obs_history.reset()
     for _ in range(obs_history.max_length):
         obs_history.append(actor_obs)
-    time_start = time.time()
-    time_counter = 0
+
+    fsm = StandFSM(cfg)
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         # Close the viewer automatically after 30 wall-seconds.
+        # Obtain an observation
+        (q, dq, quat, v, omega, gvec), foot_contact, foot_forces = get_obs(data, model)
+        q = q[-cfg.sim_config.num_actions:]
+        dq = dq[-cfg.sim_config.num_actions:]
         while viewer.is_running():
             global paused
             global one_step
@@ -531,43 +544,38 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
                 else:
                     continue
             step_start = time.time()
-            global reset
+            global reset, pre_stand, full_stand, pre_crouch, crouch
             if reset:
                 reset = False
-                time_counter = 0
+                pre_stand = False
+                full_stand = False
+                pre_crouch = False
+                crouch = False
+                fsm.reset()
                 action[:] = 0
                 # 重置 circular buffer 并写入历史帧
                 obs_history.reset()
                 for _ in range(obs_history.max_length):
                     obs_history.append(actor_obs)
 
+            # Generate PD control
+            tau = pd_control(target_q, q, cfg.robot_config.kps,
+                            target_dq, dq, cfg.robot_config.kds)  # Calc torques
+            tau = np.clip(tau, -cfg.robot_config.tau_limit, cfg.robot_config.tau_limit)
+            data.ctrl[:12] = tau
+            # mj_step can be replaced with code that also evaluates
+            # a policy and applies a control signal before stepping the physics.
+            mujoco.mj_step(model, data)
+
             # Obtain an observation
             (q, dq, quat, v, omega, gvec), foot_contact, foot_forces = get_obs(data, model)
             q = q[-cfg.sim_config.num_actions:]
             dq = dq[-cfg.sim_config.num_actions:]
-            yaw = get_yaw_from_quat(data.sensor('orientation').data)
-            des_v, des_y, des_yaw = navigator.compute_command(data.qpos[0], data.qpos[1], yaw)
-            time_counter += 1
-            des_v *= 0.0
-            des_y *= 0.0
-            des_yaw *= 0.0
-            
-            for _ in range(4):
-                J1, calf_pos_jaco = calc_jacobian(motor_pos)
-                cafl_vel_jaco = motor_vel / J1 / J2_
 
-            eu_ang = quaternion_to_euler_array(quat)
-            eu_ang[eu_ang > math.pi] -= 2 * math.pi
-            tracker.update(foot_contact)
-            step_freq = tracker.get_step_frequency()
-            # print("当前每条腿步频:", step_freq)
-            plot(foot_contact, "foot_contact")
-            plot(omega, "omega")
-            plot(foot_forces,"foot_forces")
-            plot(gvec, "gvec")
             plot(v, "v")
             plot(q, "q")
             plot(dq, "dq")
+
             # policy duartion
             if count_lowlevel % cfg.sim_config.decimation == 0:
                 obs_list = []
@@ -583,12 +591,14 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
                         obs_list.extend(gvec)
                     elif obs_name == "commands":
                         # 将线速度 vx 和 vy 转换并添加到 obs_list
-                        command[0] = -joy_data.Axis[1] * 2.0 * 2.0 + cmd.vx * 2.0 * 1.0 + des_v * 2.0
-                        command[1] = -joy_data.Axis[0]  * 2.0 * 1.0 + cmd.vy * 2.0 + des_y * 2.0 
-                        command[2] = -joy_data.Axis[3] * 0.25 + cmd.dyaw * 0.25 * np.pi / 2 + des_yaw * 0.25
+                        command[0] = -joy_data.Axis[1] * 2.0 * 2.0 + cmd.vx * 2.0 * 1.0
+                        command[1] = -joy_data.Axis[0]  * 2.0 * 1.0 + cmd.vy * 2.0
+                        command[2] = -joy_data.Axis[3] * 0.25 + cmd.dyaw * 0.25 * np.pi / 2
                         obs_list.extend([command[0],
                                         command[1],
                                         command[2]])
+                        print(f"vx: {command[0]/2.0:.2f}, vy: {command[1]/2.0:.2f}, dyaw: {command[2]/0.25:.2f}")
+                        print(f"real vx: {v[0]:.2f}, real vy: {v[1]:.2f}, real yaw rate: {omega[2]:.2f}")
                     elif obs_name == "dof_pos":
                         # 将关节位置转换并添加到 obs_list
                         obs_list.extend((q - default_pos) * 1.0)
@@ -601,53 +611,23 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
 
                 # 将整个 obs_list 转换为 NumPy 数组
                 obs = np.array([obs_list], dtype=np.float32)
-                obs_buffer.add(obs)
-                obs_torch = to_torch(obs_buffer.get_delayed_value(0.00))
                 obs_history.append(to_torch(obs))
 
                 if policy_class == "ac2_roa":
                     action[:] = policy(obs_history.buffer.reshape(1, -1))[0].detach().cpu().numpy()
                 else:
-                    action[:] = policy(obs_torch)[0].detach().cpu().numpy()
+                    action[:] = 0
                 action = np.clip(action, -100, 100)
                 #TODO Hip_reduction
                 # action[[0, 3, 6, 9]] *= 0.5
                 if action_at:
                     target_q = action * 0.25 + default_pos
-                    target_q_buffer.add(target_q)
                 else:
                     target_q = action * 0.25 * 0 + default_pos
-                    target_q_buffer.add(target_q)
-                    
-            plot(target_q, "target_q")
-            plot(command, "cmd")
-            target_dq = np.zeros((cfg.sim_config.num_actions), dtype=np.double)
-
-            # Generate PD control
-            tau = pd_control(target_q_buffer.get_delayed_value(0.00), q, cfg.robot_config.kps,
-                            target_dq, dq, cfg.robot_config.kds)  # Calc torques
-
-            tau = np.clip(tau, -cfg.robot_config.tau_limit, cfg.robot_config.tau_limit)
-            global disable_mode
-            if (abs(tau) > cfg.robot_config.tau_limit).any():
-                disable_mode = True
+           
+            # fsm.update(q, dq, data, pd_control, stable_pos, default_pos, crouch_pos,
+            #            pre_stand=pre_stand, full_stand=full_stand, pre_crouch=pre_crouch, crouch=crouch)
             
-            for i in range(4):
-                J1, _ = calc_jacobian(motor_pos)
-                cafl_tau_jaco = tau[2+i*3] / J1 / J2_
-
-            global hangup
-            if hangup:
-                data.qvel[0] = 1.0
-                for i, name in enumerate(joint_names):
-                    data.joint(name).qpos = default_pos[i]
-
-            plot(tau, "tau")
-            data.ctrl[:12] = tau
-
-            # mj_step can be replaced with code that also evaluates
-            # a policy and applies a control signal before stepping the physics.
-            mujoco.mj_step(model, data)
             viewer.sync()
 
             count_lowlevel += 1
@@ -656,7 +636,7 @@ def run_mujoco(policy, estimator, lidar_encoder, cfg: Sim2simCfg):
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
             else:
-                print("Warning: step took {:.3f}s".format(time.time() - step_start))
+                # print("Warning: step took {:.3f}s".format(time.time() - step_start))
                 pass
         global done
         done = True
@@ -667,7 +647,6 @@ def init_joystick():
     global joystick
     pygame.joystick.init()  # 初始化手柄
     joystick_count = pygame.joystick.get_count()
-    print(joystick_count)
 
     if joystick_count > 0:
         try:
@@ -675,7 +654,7 @@ def init_joystick():
             joystick.init()
             print("Joystick initialized!")
         except pygame.error as e:
-            print(f"Failed to initialize joystick: {e}")
+            # print(f"Failed to initialize joystick: {e}")
             joystick = None
     else:
         joystick = None
@@ -694,7 +673,7 @@ def joy_loop():
 
         # 检查手柄是否连接，使用 get_init() 判断是否初始化
         if joystick is None or not joystick.get_init():
-            print("Joystick disconnected, attempting to reconnect...")
+            # print("Joystick disconnected, attempting to reconnect...")
             init_joystick()  # 如果手柄断开，尝试重新连接
             time.sleep(1)  # 重连时增加 sleep 时间，给重连过程提供更多时间
         else:
@@ -705,7 +684,7 @@ def joy_loop():
                     joy_data.Axis[axis] = value
 
                     # 设定阈值，避免小幅度的摇动
-                    if abs(joy_data.Axis[axis]) < 0.2:
+                    if abs(joy_data.Axis[axis]) < 0.05:
                         joy_data.Axis[axis] = 0
 
                 # 处理按键输入
@@ -715,7 +694,7 @@ def joy_loop():
                         joy_data.button = button
 
             except pygame.error:
-                print("Joystick disconnected during use, attempting to reconnect...")
+                # print("Joystick disconnected during use, attempting to reconnect...")
                 joystick = None  # 手柄断开时，清除旧的 joystick 实例
                 init_joystick()  # 尝试重新连接手柄
 
@@ -724,19 +703,15 @@ def joy_loop():
 # 这里是main函数
 if __name__ == '__main__':
     #TODO Policy path
-    path = f'pre-trian_policy/model_20000.pt'
-    if path == f'pre-trian_policy/model_20000.pt':
+    path = f'pre-trian_policy/policy.pt'
+    if path == f'pre-trian_policy/policy.pt':
         policy_class = "ac2_roa"
     else:
         policy_class = "ac2_amp"
-    policy = torch.jit.load(path, map_location=torch.device('cuda'))
-
-    # 实例化配置类obs_buffer
-    obs_buffer = ObsBuffer(max_length=10, dt=Sim2simCfg.sim_config.dt)
-    target_q_buffer = ObsBuffer(max_length=10, dt=Sim2simCfg.sim_config.dt)
+    policy = torch.jit.load(path, map_location=torch.device('cuda:0'))
     
     # 创建两个线程
-    thread1 = threading.Thread(target=run_mujoco, args=(policy, None, None, Sim2simCfg))
+    thread1 = threading.Thread(target=run_mujoco, args=(policy, Sim2simCfg))
     thread2 = threading.Thread(target=joy_loop, args=())
 
     # 启动线程
