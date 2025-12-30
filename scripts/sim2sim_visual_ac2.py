@@ -519,7 +519,6 @@ def run_mujoco(cfg: Sim2simCfg):
                     target_q = action_np * cfg.sim_config.action_scale + cfg.robot_config.default_joint_angles
 
             # --- Physics Loop (200Hz) ---
-            # [关键] 使用映射索引读取状态
             q_active = data.qpos[joint_qpos_ids]
             dq_active = data.qvel[joint_qvel_ids]
             
