@@ -5,36 +5,48 @@ import mujoco
 import mujoco.viewer
 from scipy.spatial.transform import Rotation as R
 from collections import deque
+import torch.nn.functional as F
 import pygame
 import threading
 import torch
-import torch.nn as nn # Added for Vision Network
+import torch.nn as nn
 import os
 
 # ===================================================================
-# [新增] 视觉网络结构定义 (必须保留以加载权重)
+# 1. 视觉网络结构 
 # ===================================================================
+
 class DepthOnlyFCBackbone58x87(nn.Module):
     def __init__(self, prop_dim, scandots_output_dim, hidden_state_dim, output_activation=None, num_frames=1):
         super().__init__()
+
         self.num_frames = num_frames
         activation = nn.ELU()
         self.image_compression = nn.Sequential(
+            # [1, 58, 87]
             nn.Conv2d(in_channels=self.num_frames, out_channels=32, kernel_size=5),
+            # [32, 54, 83]
             nn.MaxPool2d(kernel_size=2, stride=2),
+            # [32, 27, 41]
             activation,
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3),
             activation,
             nn.Flatten(),
+            # [32, 25, 39]
             nn.Linear(64 * 25 * 39, 128),
             activation,
             nn.Linear(128, scandots_output_dim)
         )
-        self.output_activation = nn.Tanh() if output_activation == "tanh" else activation
+
+        if output_activation == "tanh":
+            self.output_activation = nn.Tanh()
+        else:
+            self.output_activation = activation
 
     def forward(self, images: torch.Tensor):
         images_compressed = self.image_compression(images.unsqueeze(1))
         latent = self.output_activation(images_compressed)
+
         return latent
 
 class RecurrentDepthBackbone(nn.Module):
@@ -43,32 +55,36 @@ class RecurrentDepthBackbone(nn.Module):
         activation = nn.ELU()
         last_activation = nn.Tanh()
         self.base_backbone = base_backbone
-        self.combination_mlp = nn.Sequential(
-            nn.Linear(32 + env_cfg.env.n_proprio, 128),
-            activation,
-            nn.Linear(128, 32)
-        )
+        if env_cfg == None:
+            self.combination_mlp = nn.Sequential(
+                                    nn.Linear(32 + 53, 128),
+                                    activation,
+                                    nn.Linear(128, 32)
+                                )
+        else:
+            self.combination_mlp = nn.Sequential(
+                                        nn.Linear(32 + env_cfg.env.n_proprio, 128),
+                                        activation,
+                                        nn.Linear(128, 32)
+                                    )
         self.rnn = nn.GRU(input_size=32, hidden_size=512, batch_first=True)
         self.output_mlp = nn.Sequential(
-            nn.Linear(512, 32+2), 
-            last_activation
-        )
+                                nn.Linear(512, 32+2),
+                                last_activation
+                            )
         self.hidden_states = None
 
     def forward(self, depth_image, proprioception):
-        depth_latent_cnn = self.base_backbone(depth_image)
-        combined_input = torch.cat((depth_latent_cnn, proprioception), dim=-1)
-        depth_latent = self.combination_mlp(combined_input)
-        
-        if self.hidden_states is None or self.hidden_states.shape[1] != depth_latent.shape[0]:
-            self.hidden_states = torch.zeros(1, depth_latent.shape[0], 512, device=depth_latent.device)
-            
+        depth_image = self.base_backbone(depth_image)
+        depth_latent = self.combination_mlp(torch.cat((depth_image, proprioception), dim=-1))
+        # depth_latent = self.base_backbone(depth_image)
         depth_latent, self.hidden_states = self.rnn(depth_latent[:, None, :], self.hidden_states)
-        output = self.output_mlp(depth_latent.squeeze(1))
-        return output
+        depth_latent = self.output_mlp(depth_latent.squeeze(1))
+        
+        return depth_latent
 
-    def reset(self):
-        self.hidden_states = None
+    def detach_hidden_states(self):
+        self.hidden_states = self.hidden_states.detach().clone()
 
 class MockEnvCfg:
     def __init__(self):
@@ -78,467 +94,480 @@ class MockEnvCfg:
             self.n_proprio = 53 
 
 # ===================================================================
-# 原有代码逻辑
+# 2. 全局配置与状态变量
 # ===================================================================
 
-# from plot import plot # 如果没有plot文件，可以注释掉
-def plot(*args): pass
+class Sim2simCfg:
+    class sim_config:
+        mujoco_model_path = "assets/actiger/ac2/urdf/scene_terrain.xml"
+        base_jit_path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-base_jit.pt"
+        vision_weight_path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-vision_weight.pt"
+        
+        dt = 0.005
+        decimation = 4
+        num_actions = 12
+        
+        # Dimensions
+        n_proprio = 53
+        history_len = 10
+        dim_scan = 132
+        dim_priv_explicit = 9
+        dim_priv_latent = 29
 
-from utils.buffers import CircularBuffer
-from enum import Enum, auto
+        
+        # Scales
+        lin_vel_scale = 2.0
+        ang_vel_scale = 0.25
+        dof_pos_scale = 1.0
+        dof_vel_scale = 0.05
+        action_scale = 0.5
+        clip_actions = 1.2
 
-class StandState(Enum):
-    IDLE = auto()
-    PRE_STAND = auto()
-    FULL_STAND = auto()
-    PRE_CROUCH = auto()
-    CROUCH = auto()
-    STAND_DONE = auto()
+        #depth
+        near_clip = 0
+        far_clip = 2
+        camera_name = 'depth_camera'
+        camera_width_original = 106
+        camera_height_original = 60
+    
+        camera_width_resized = 87
+        camera_height_resized = 58
 
-class StandFSM:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.state = StandState.IDLE
-        self.timer = 0.0
-        self.start_pos = None
+    class robot_config:
+        kps = np.array([40.0]*12, dtype=np.double)
+        kds = np.array([1.0]*12, dtype=np.double)
+        tau_limit = 60. * np.ones(12, dtype=np.double)
+        # 默认站立姿态 (FL, FR, RL, RR)
+        default_joint_angles = np.array([
+            -0.1, 0.9, -1.55,  # FL
+            0.1, 0.9, -1.55,   # FR
+            -0.1, 0.9, -1.55,  # RL
+            0.1, 0.9, -1.55    # RR
+        ], dtype=np.double)
 
-    def reset(self):
-        self.state = StandState.IDLE
-        self.timer = 0.0
-        self.start_pos = None
-
-    def _interpolate_motion(self, target_pos, q, dq, data, pd_control,
-                            p_gain=100, d_gain=2, speed=1.0):
-        dt = self.cfg.sim_config.dt
-        tau_limit = self.cfg.robot_config.tau_limit
-        num_actions = self.cfg.sim_config.num_actions
-
-        self.timer += dt / speed
-        alpha = min(self.timer, 1.0)
-
-        target_q = target_pos * alpha + self.start_pos * (1 - alpha)
-        target_dq = np.zeros(num_actions)
-        tau = pd_control(target_q, q, p_gain, target_dq, dq, d_gain)
-        tau = np.clip(tau, -tau_limit, tau_limit)
-        # 注意：这里需要配合 Actuator Mapping，稍后在 main loop 统一处理
-        # data.ctrl[:12] = tau 
-        return alpha >= 1.0
-
-    def update(self, q, dq, data, pd_control,
-               stable_pos, default_pos, crouch_pos,
-               pre_stand=False, full_stand=False, pre_crouch=False, crouch=False):
-        done = False
-        # (FSM logic remains same, removed for brevity as it is unused in Policy loop)
-        return self.state, done
-
-# [修正] 默认关节角度 (Vision Policy Standard: Hip 0, Thigh 0.9, Calf -1.55)
-default_joint_angles = {
-    'FL_hip_joint': -0.1, 'RL_hip_joint': -0.1, 'FR_hip_joint': 0.1, 'RR_hip_joint': 0.1,
-    'FL_thigh_joint': 0.9, 'RL_thigh_joint': 0.9, 'FR_thigh_joint': 0.9, 'RR_thigh_joint': 0.9,
-    'FL_calf_joint': -1.55, 'RL_calf_joint': -1.55, 'FR_calf_joint': -1.55, 'RR_calf_joint': -1.55,
-}
-
-stable_joint_angles = default_joint_angles.copy() # Placeholder
-lay_down_joint_angles = default_joint_angles.copy() # Placeholder
-
-joint_names = [
-    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
-    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"
-]
-
-np.set_printoptions(suppress=True, precision=3)
-
-def to_torch(x, dtype=torch.float, device='cuda:0', requires_grad=False):
-    return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
-
-device = 'cuda:0'
-
-# Global flags
-paused = False
-one_step = False
-action_at = True
 done = False
-disable_mode = False
-pre_stand = False
-full_stand = False
-pre_crouch = False
-crouch = False
-hangup = False
+paused = False
 reset = False
-
-policy_class = None
-
-button = { 'X': 2, 'Y': 3, 'B': 1, 'A': 0, 'LB': 4, 'RB': 5, 'SELECT': 6, 'START': 7, 'home': 8, 'return': 11 }
-
-class joy_data:
-    Axis = [0] * 8
-    button = 0
-    button_last = 0
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class cmd:
     vx = 0.0
     vy = 0.0
     dyaw = 0.0
 
-def joy_init():
-    global done
-    while (done !=True):
-        pygame.init()
-        pygame.joystick.init()
-        joystick_count = pygame.joystick.get_count()
-        if joystick_count > 0:
-            joystick = pygame.joystick.Joystick(0)
-            joystick.init()
-            print("Joystick Name: {}".format(joystick.get_name()))
-            break
-        else:
-            time.sleep(0.5)
+class joy_data:
+    Axis = [0] * 8
+    button = 0
+    button_last = 0
+
+# ===================================================================
+# 3. 核心工具函数
+# ===================================================================
 
 def key_callback(keycode):
-    global reset, paused, action_at, one_step
-    if keycode == 259: reset = not reset
-    if chr(keycode) == ' ': paused = not paused
-    if keycode == 320: action_at = not action_at
-    if keycode == 334: one_step = not one_step
-    if keycode == 265: cmd.vx = 1.0
-    elif keycode == 264: cmd.vx = -1.0
-    else: cmd.vx = 0.0
-    if keycode == 263: cmd.dyaw = 1.0  
-    elif keycode == 262: cmd.dyaw = -1.0
-    else: cmd.dyaw = 0.0
 
-@torch.jit.script
-def quat_rotate_inverse(q, v):
-    shape = q.shape
-    q_w = q[:, -1]
-    q_vec = q[:, :3]
-    a = v * (2.0 * q_w ** 2 - 1.0).unsqueeze(-1)
-    b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
-    c = q_vec * torch.bmm(q_vec.view(shape[0], 1, 3), v.view(shape[0], 3, 1)).squeeze(-1) * 2.0
-    return a - b + c
+    if keycode == 259:
+        global reset
+        reset = not reset
+
+    # 空格键,暂停仿真
+    if chr(keycode) == ' ':
+        global paused
+        paused = not paused
+
+    if keycode == 320:
+        global action_at
+        action_at = not action_at
+
+    if keycode == 321:
+        global disable_mode
+        disable_mode = not disable_mode
+
+    if keycode == 322:
+        global pre_stand
+        pre_stand = not pre_stand
+
+    if keycode == 323:
+        global full_stand
+        full_stand = not full_stand
+
+    if keycode == 324:
+        global pre_crouch
+        pre_crouch = not pre_crouch
+
+    if keycode == 325:
+        global crouch
+        crouch = not crouch
+
+    if keycode == 334:
+        global one_step
+        one_step = not one_step
+
+    # 方向键上,前进速度
+    if keycode == 265:
+        cmd.vx = 1.0
+    # 方向键下,后退速度
+    elif keycode == 264:
+        cmd.vx = -1.0
+    else:
+        cmd.vx = 0.0
+
+    # 方向键左,左平移速度
+    if keycode == 263:
+        cmd.dyaw = 1.0  
+    elif keycode == 262:
+        cmd.dyaw = -1.0
+    else:
+        cmd.dyaw = 0.0
+
+class CircularBuffer:
+    def __init__(self, max_len, shape, device):
+        self.buffer = deque(maxlen=max_len)
+        self.shape = shape
+        self.device = device
+        self.reset()
+
+    def add(self, obs):
+        self.buffer.append(obs)
+
+    def get_stacked(self):
+        return torch.stack(list(self.buffer), dim=1)
+
+    def reset(self):
+        self.buffer.clear()
+        for _ in range(self.buffer.maxlen):
+            self.buffer.append(torch.zeros(self.shape, device=self.device))
 
 def get_foot_contact(data, model):
+    # 存储每个脚的总接触力模长
     foot_forces = np.zeros(4)
     foot_contact = np.zeros(4)
-    foot_geom_names = ['FL_foot_fixed', 'FR_foot_fixed', 'RL_foot_fixed', 'RR_foot_fixed']
-    foot_idx = {name: i for i, name in enumerate(foot_geom_names)}
+    foot_geom_names = [
+        'FL_foot_fixed',
+        'FR_foot_fixed',
+        'RL_foot_fixed',
+        'RR_foot_fixed'
+    ]
+    foot_idx = {
+        'FL_foot_fixed': 0,
+        'FR_foot_fixed': 1,
+        'RL_foot_fixed': 2,
+        'RR_foot_fixed': 3
+    }
+
+    # 每个 contact 可计算 6 维力（3 正交方向 + 3 摩擦方向）
     force = np.zeros(6)
+    
     ground_geom_names = ['floor']
     for i in range(data.ncon):
         contact = data.contact[i]
         mujoco.mj_contactForce(model, data, i, force)
         g1 = model.geom(contact.geom1).name
         g2 = model.geom(contact.geom2).name
+        
+        # 检测脚与地面的接触
         if (g1 in ground_geom_names and g2 in foot_geom_names) or (g2 in ground_geom_names and g1 in foot_geom_names):
             foot_name = g1 if g2 in ground_geom_names else g2   
+            # 力的模长（L2范数），只用前3维（接触方向 + 摩擦合力）
             force_norm = np.linalg.norm(force[0:3])
             foot_forces[foot_idx[foot_name]] = force_norm
             foot_contact[foot_idx[foot_name]] = 1.0
     return foot_contact, foot_forces
 
-def get_obs(data, model):
-    # This function extracts raw data, the assembly into 53-dim tensor happens in run_mujoco
-    q = data.qpos[7:] # Skip free joint
-    dq = data.qvel[6:]
-    quat = data.qpos[3:7] # [w, x, y, z]
-    
-    # Transform Quat to [x, y, z, w] for Scipy/Vision compatibility
-    quat_scipy = np.array([quat[1], quat[2], quat[3], quat[0]])
-    r = R.from_quat(quat_scipy)
-    
-    v = r.apply(data.qvel[:3], inverse=True).astype(np.double)
-    omega = data.qvel[3:6] # Base ang vel
-    # Vision code usually projects gravity inverse
-    gvec = r.inv().apply(np.array([0., 0., -1.])).astype(np.double)
-    
-    foot_contact, foot_forces = get_foot_contact(data, model)
-    obs_delay = q, dq, quat_scipy, v, omega, gvec # Return quat in x,y,z,w format
-    return obs_delay, foot_contact, foot_forces
+def get_proprio_obs(data, model, cmd_vel, last_action, cfg: Sim2simCfg, joint_qpos_ids, joint_qvel_ids):
 
-def pd_control(target_q, q, kp, target_dq, dq, kd):
-    return (target_q - q) * kp + (target_dq - dq) * kd
 
-class Sim2simCfg():
-    class sim_config:
-        # [Updated Path]
-        mujoco_model_path = "assets/actiger/ac2/urdf/scene_terrain.xml"
-        # [Vision Path]
-        vision_weight_path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-vision_weight.pt"
+    obs_list = []
+    
+    # 1. Base Angular Velocity (3)
+    quat = data.sensor('orientation').data[[1, 2, 3, 0]].astype(np.double)
+    omega = data.sensor('angular-velocity').data.astype(np.double)
+    r = R.from_quat(quat)
+    obs_list.append(torch.tensor(omega * cfg.sim_config.ang_vel_scale, device=device).float())
+    
+    # 2. IMU RPY (2)
+    euler = r.as_euler('xyz', degrees=False)
+    obs_list.append(torch.tensor(euler[:2], device=device).float())
+    
+    # 3. Commands & Nav Placeholders (3 + 2 = 5)
+    nav_padding = torch.zeros(3, device=device) # 3个 0: padding, delta_yaw, next_yaw
+    obs_list.append(nav_padding)
+    
+    masked_cmd = torch.zeros(2, device=device)  # 2个 0: masked vx, vy
+    obs_list.append(masked_cmd)
+    
+    # 4. Active Command (1)
+    final_vx = -joy_data.Axis[1] * 2.0 + cmd_vel.vx * 2.0
+    final_vy = -joy_data.Axis[0] * 2.0 + cmd_vel.vy * 2.0
+    final_dyaw = -joy_data.Axis[3] * 1.0 + cmd_vel.dyaw * 1.0
+    # raw_axis_1 = joy_data.Axis[1]
+    # if abs(raw_axis_1) < 0.1: # 死区阈值
+    #     raw_axis_1 = 0.0
         
-        sim_duration = 60.0
-        dt = 0.005
-        decimation = 4
-        num_actions = 12
-        
-        # [Vision Params]
-        lin_vel_scale = 2.0
-        ang_vel_scale = 0.25
-        dof_pos_scale = 1.0
-        dof_vel_scale = 0.05
-        action_scale = 0.25
-        dim_scan = 132
-        dim_priv = 9
-
-    class robot_config:
-        # [Updated Gains]
-        kps = np.array([40.0]*12, dtype=np.double)
-        kds = np.array([1.0]*12, dtype=np.double)
-        tau_limit = 60. * np.ones(12, dtype=np.double)
-
-def run_mujoco(policy, cfg: Sim2simCfg):
-    global done, reset, action_at
+    # final_vx = -raw_axis_1 * 2.0 + cmd_vel.vx * 2.0
     
-    if not os.path.exists(cfg.sim_config.mujoco_model_path):
-        print("XML Not Found!")
-        return
+    # print(f"Vx Command: {final_vx:.4f}")
 
+
+    
+    cmd_tensor = torch.tensor([
+        final_vx * cfg.sim_config.lin_vel_scale
+    ], device=device).float() # 只取 vx
+    obs_list.append(cmd_tensor)
+    
+    # 5. Env ID (2)
+    env_id = torch.tensor([1.0, 0.0], device=device).float()
+    obs_list.append(env_id)
+    
+    # 6. Dof Pos (12)
+    curr_q = data.qpos[joint_qpos_ids]
+    dof_pos_err = (torch.tensor(curr_q, device=device).float() - torch.tensor(cfg.robot_config.default_joint_angles, device=device).float()) * cfg.sim_config.dof_pos_scale
+    obs_list.append(dof_pos_err)
+    
+    # 7. Dof Vel (12)
+    curr_dq = data.qvel[joint_qvel_ids]
+    dof_vel = torch.tensor(curr_dq, device=device).float() * cfg.sim_config.dof_vel_scale
+    obs_list.append(dof_vel)
+    
+    # 8. Last Action (12)
+    obs_list.append(last_action)
+    
+    # 9. Foot Contact (4)
+    try:
+        fc_binary, _ = get_foot_contact(data, model)
+        fc_tensor = torch.tensor(fc_binary, device=device).float() - 0.5
+        obs_list.append(fc_tensor)
+        
+    except Exception as e:
+        print(f"Foot Contact Error: {e}, using placeholder.")
+        obs_list.append(torch.tensor([-0.5] * 4, device=device).float())
+    
+    # 10. 拼接
+    proprio = torch.cat(obs_list).view(1, -1)
+    return proprio
+
+def set_camera_fov(model, camera_name, horizontal_fov_deg, width, height):
+    """
+    自动将水平FOV转换为垂直FOV并设置给MuJoCo模型
+    """
+    # 1. 计算长宽比
+    aspect_ratio = width / height
+    
+    # 2. 数学转换 (度 -> 弧度 -> 正切 -> 除以长宽比 -> 反正切 -> 度)
+    horizontal_fov_rad = math.radians(horizontal_fov_deg)
+    vertical_fov_rad = 2 * math.atan(math.tan(horizontal_fov_rad / 2) / aspect_ratio)
+    vertical_fov_deg = math.degrees(vertical_fov_rad)
+    
+    # 3. 找到相机ID并修改
+    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    if cam_id != -1:
+        # MuJoCo 的 model.cam_fovy 存储的是垂直FOV
+        model.cam_fovy[cam_id] = vertical_fov_deg
+        print(f"📷 [Camera Setup] '{camera_name}': H_FOV={horizontal_fov_deg}° -> V_FOV={vertical_fov_deg:.2f}° (Aspect={aspect_ratio:.2f})")
+    else:
+        print(f"⚠️ Warning: Camera '{camera_name}' not found!")
+
+def process_depth(renderer, data, cfg):
+    try:
+        camera_id = mujoco.mj_name2id(renderer._model, mujoco.mjtObj.mjOBJ_CAMERA, cfg.sim_config.camera_name)
+    except:
+        camera_id = 0
+    renderer.update_scene(data, camera=camera_id)
+    renderer.enable_depth_rendering()
+    depth_img = renderer.render()
+    renderer.disable_depth_rendering()
+    depth_t = torch.from_numpy(depth_img.copy()).float().to(device)
+    depth_t = torch.clip(depth_t, cfg.sim_config.near_clip, cfg.sim_config.far_clip)
+    depth_t = depth_t.unsqueeze(0).unsqueeze(0)
+    depth_t = F.interpolate(
+        depth_t, 
+        size=(Sim2simCfg.sim_config.camera_height_resized, Sim2simCfg.sim_config.camera_width_resized), # (58, 87)
+        mode='bicubic', 
+        align_corners=False
+    )
+    depth_t = (depth_t - cfg.sim_config.near_clip) / (cfg.sim_config.far_clip - cfg.sim_config.near_clip)
+    depth_t = 1.0 - depth_t
+    return depth_t.squeeze(1)
+
+# ===================================================================
+# 4. 主仿真循环 (Run Mujoco)
+# ===================================================================
+
+def run_mujoco(cfg: Sim2simCfg):
+    global done, reset, paused
     model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
     data = mujoco.MjData(model)
     model.opt.timestep = cfg.sim_config.dt
+    renderer = mujoco.Renderer(model, width=cfg.sim_config.camera_width_original, height=cfg.sim_config.camera_height_original)
+    set_camera_fov(
+        model=model,
+        camera_name=cfg.sim_config.camera_name, 
+        horizontal_fov_deg=87, 
+        width=cfg.sim_config.camera_width_original, # 106
+        height=cfg.sim_config.camera_height_original # 60
+    )
 
-    # ---  Init Vision ---
-    print("Initializing Vision...")
-    try:
-        loaded_obj = torch.jit.load(cfg.sim_config.vision_weight_path, map_location=device)
-        vision_model = loaded_obj
-        print("Vision JIT Loaded")
-    except:
-        loaded_obj = torch.load(cfg.sim_config.vision_weight_path, map_location=device, weights_only=False)
-        mock_env = MockEnvCfg()
-        backbone = DepthOnlyFCBackbone58x87(mock_env.env.n_proprio, 32, [512, 256, 128], 'elu')
-        vision_model = RecurrentDepthBackbone(backbone, mock_env).to(device)
-        if isinstance(loaded_obj, dict):
-            if 'depth_encoder_state_dict' in loaded_obj:
-                vision_model.load_state_dict(loaded_obj['depth_encoder_state_dict'])
-            else:
-                vision_model.load_state_dict(loaded_obj)
-        else:
-            vision_model = loaded_obj
-        print("Vision Dict Loaded")
+    print("Loading Models...")
+    # Base JIT
+    base_model = torch.jit.load(cfg.sim_config.base_jit_path, map_location=device)
+    base_model.eval()
+    estimator = base_model.estimator.estimator
+    hist_encoder = base_model.actor.history_encoder
+    actor = base_model.actor.actor_backbone
+
+    mock_env = MockEnvCfg()
+    backbone = DepthOnlyFCBackbone58x87(None,32,512) 
+    vision_model = RecurrentDepthBackbone(backbone, None).to(device)
+    vision_weights = torch.load(cfg.sim_config.vision_weight_path, map_location=device)
+    vision_model.load_state_dict(vision_weights.get('depth_encoder_state_dict', vision_weights))
     vision_model.eval()
-
-    # --- Setup Renderer ---
-    renderer = mujoco.Renderer(model, height=58, width=87)
-    try:
-        camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "depth_camera")
-    except:
-        camera_id = 0
-
-    # ---  Re-indexing Logic ---
-    all_joint_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
-    policy_joint_names = ["FL_hip_joint", "FL_thigh_joint", "FL_calf_joint", 
-                          "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-                          "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
-                          "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"]
+    print("Models Loaded.")
+    target_joint_names = [
+        "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint", 
+        "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+        "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+        "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"
+    ]
     
-    joint_indices = []
-    for name in policy_joint_names:
-        for i, xml_name in enumerate(all_joint_names):
-            if name in xml_name: 
-                joint_indices.append(i)
-                break
-    joint_indices = np.array(joint_indices)
+    print("Mapping Joints...")
+    joint_qpos_ids = []
+    joint_qvel_ids = []
     
-    actuator_indices = []
-    for idx in joint_indices:
-        for i in range(model.nu):
-            if model.actuator_trnid[i, 0] == idx:
-                actuator_indices.append(i)
-                break
-    actuator_indices = np.array(actuator_indices)
-    print(f"Joints Re-indexed: {joint_indices}")
+    for name in target_joint_names:
+        # 1. 查找关节对象 ID
+        j_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if j_id == -1:
+            print(f"[Error] Joint '{name}' not found in XML! Please check names.")
+            return
 
-    # Initialize positions
-    default_pos = np.zeros(cfg.sim_config.num_actions, dtype=np.double)
-    for i, leg in enumerate(['FL', 'FR', 'RL', 'RR']):
-        default_pos[3*i:3*i+3] = [default_joint_angles[f'{leg}_hip_joint'],
-                                  default_joint_angles[f'{leg}_thigh_joint'],
-                                  default_joint_angles[f'{leg}_calf_joint']]
+        # 2. 查找该关节在 qpos 和 qvel 数组中的起始地址
+        qpos_addr = model.jnt_qposadr[j_id]
+        qvel_addr = model.jnt_dofadr[j_id]
+        
+        joint_qpos_ids.append(qpos_addr)
+        joint_qvel_ids.append(qvel_addr)
+        
+        print(f"  {name}: qpos_idx={qpos_addr}, qvel_idx={qvel_addr}")
+        
+    joint_qpos_ids = np.array(joint_qpos_ids)
+    joint_qvel_ids = np.array(joint_qvel_ids)
+    # -----------------------------------------------------------------------------------
 
-    target_q = default_pos.copy()
-    target_dq = np.zeros(cfg.sim_config.num_actions, dtype=np.double)
+    obs_history = CircularBuffer(cfg.sim_config.history_len, (1, cfg.sim_config.n_proprio), device)
     last_action = torch.zeros(12, device=device)
-    command = np.zeros(3, dtype=np.double)
+    target_q = cfg.robot_config.default_joint_angles.copy()
+    count_lowlevel = 0
+    
+    # 预填充
+    # zero_obs = torch.zeros(1, cfg.sim_config.n_proprio, device=device)
+    # for _ in range(cfg.sim_config.history_len): obs_history.add(zero_obs)
 
-    # Initial Physics Setup
     def reset_sim():
-        data.qpos[:] = 0; data.qvel[:] = 0
-        data.qpos[2] = 0.6; data.qpos[3] = 1.0
-        q_corr = joint_indices - 1
-        for i, idx in enumerate(q_corr): data.qpos[7+idx] = default_pos[i]
-        if hasattr(vision_model, "reset"): vision_model.reset()
+        mujoco.mj_resetData(model, data)
+        data.qpos[2] = 0.25
+        
+        # 使用映射索引来重置关节角度
+        # data.qpos[joint_qpos_ids] 只写入这12个位置，跳过 Screw/Motor 等
+        data.qpos[joint_qpos_ids] = cfg.robot_config.default_joint_angles
+        
         mujoco.mj_forward(model, data)
         for _ in range(20): mujoco.mj_step(model, data)
-    
+        
+        obs_history.reset()
+        if hasattr(vision_model, "reset"): vision_model.reset()
+        last_action[:] = 0
+
     reset_sim()
-    count_lowlevel = 0
 
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
-        (q_raw, dq_raw, quat, v, omega, gvec), _, _ = get_obs(data, model)
-        
-        while viewer.is_running():
-            global paused
+        while viewer.is_running() and not done:
             if paused:
                 time.sleep(0.1); viewer.sync(); continue
-            
-            step_start = time.time()
             if reset:
-                reset = False
-                reset_sim()
-                last_action[:] = 0
+                reset = False; reset_sim()
 
-            # --- Control Loop (50Hz) ---
+            step_start = time.time()
+
+            # --- Policy Loop (50Hz) ---
             if count_lowlevel % cfg.sim_config.decimation == 0:
                 with torch.no_grad():
-                    # 1. Update Proprioception (53 dim)
-                    obs_list = []
-                    # Angular Vel (3)
-                    base_ang_vel_body = quat_rotate_inverse(to_torch(quat[None]), to_torch(omega[None])).squeeze(0)
-                    obs_list.append(base_ang_vel_body * cfg.sim_config.ang_vel_scale)
-                    # Gravity (2)
-                    obs_list.append(to_torch(gvec[:2]))
-                    # Commands (3)
-                    command[0] = -joy_data.Axis[1] * 2.0 * 2.0 + cmd.vx * 2.0
-                    command[1] = -joy_data.Axis[0] * 2.0 * 1.0 + cmd.vy * 2.0
-                    command[2] = -joy_data.Axis[3] * 0.25 + cmd.dyaw * 0.25 * np.pi/2
-                    cmd_tensor = to_torch([
-                        command[0] * cfg.sim_config.lin_vel_scale / 2.0, 
-                        command[1] * cfg.sim_config.lin_vel_scale / 2.0,
-                        command[2] * cfg.sim_config.ang_vel_scale / 0.25
-                    ]) # Adjusting for joystick logic
-                    obs_list.append(cmd_tensor)
-                    # Misc (4)
-                    obs_list.append(torch.zeros(4, device=device))
-                    # Joint Pos (12)
-                    q_corr = joint_indices - 1
-                    curr_q = data.qpos[7:][q_corr]
-                    curr_dq = data.qvel[6:][q_corr]
-                    dof_err = (to_torch(curr_q) - to_torch(default_pos)) * cfg.sim_config.dof_pos_scale
-                    obs_list.append(dof_err)
-                    # Joint Vel (12)
-                    obs_list.append(to_torch(curr_dq) * cfg.sim_config.dof_vel_scale)
-                    # Action (12)
-                    obs_list.append(last_action)
-                    # Feet (5)
-                    obs_list.append(torch.zeros(5, device=device))
+                    # 1. Proprioception (传入 indices)
+                    proprio = get_proprio_obs(data, model, cmd, last_action, cfg, joint_qpos_ids, joint_qvel_ids)
                     
-                    prop_53 = torch.cat(obs_list).view(1, -1)
-                    if prop_53.shape[1] < 53: 
-                        prop_53 = torch.cat([prop_53, torch.zeros(1, 53-prop_53.shape[1], device=device)], dim=1)
+                    # 2. Vision & Yaw
+                    depth_t = process_depth(renderer, data, cfg)
+                    vis_out = vision_model(depth_t, proprio)
+                    depth_latent = vis_out[:, :-2]
+                    visual_yaw = vis_out[:, -2:]
+                    proprio[:, 6:8] = visual_yaw * 1.5
+                    
+                    # 3. History
+                    obs_history.add(proprio)
+                    hist_input = obs_history.get_stacked()
+                    activation = nn.ELU()
+                    hist_latent = hist_encoder(activation, hist_input).view(1, -1)
 
-                    # 2. Get Depth
-                    renderer.update_scene(data, camera=camera_id)
-                    renderer.enable_depth_rendering()
-                    depth_img = renderer.render()
-                    renderer.disable_depth_rendering()
-                    depth_t = torch.from_numpy(depth_img).float().to(device)
-                    depth_t = torch.clamp(depth_t, 0.0, 3.0) / 3.0
-                    depth_t = depth_t.unsqueeze(0)
-
-                    # 3. Vision Forward
-                    if not torch.isnan(prop_53).any():
-                        vis_out = vision_model(depth_t, prop_53)
-                        latent = vis_out[:, :32]
-                        
-                        # Full Obs
-                        scan_pad = torch.zeros(1, cfg.sim_config.dim_scan, device=device)
-                        priv_pad = torch.zeros(1, cfg.sim_config.dim_priv, device=device)
-                        hist_pad = torch.zeros(1, 600, device=device)
-                        
-                        full_obs = torch.cat([prop_53, scan_pad, priv_pad, hist_pad], dim=1)
-                        
-                        # Policy
-                        raw_action = policy(full_obs, latent)[0]
-                        last_action = raw_action
-                        
-                        action_np = raw_action.detach().cpu().numpy()
-                        action_np = np.clip(action_np, -100, 100)
-                        
-                        if action_at:
-                            target_q = action_np * cfg.sim_config.action_scale + default_pos
-                        else:
-                            target_q = default_pos.copy()
+                    # 4. Estimator & Full Obs
+                    est_vel = estimator(proprio)
+                    full_obs = torch.cat([proprio, depth_latent, est_vel, hist_latent], dim=1)
+                    
+                    # 5. Actor
+                    raw_action = actor(full_obs)[0]
+                    last_action = raw_action
+                    
+                    action_np = raw_action.cpu().numpy()
+                    action_np = np.clip(action_np, -cfg.sim_config.clip_actions, cfg.sim_config.clip_actions)
+                    target_q = action_np * cfg.sim_config.action_scale + cfg.robot_config.default_joint_angles
 
             # --- Physics Loop (200Hz) ---
-            q_corr = joint_indices - 1
-            all_q = data.qpos[7:]
-            all_dq = data.qvel[6:]
+            # [关键] 使用映射索引读取状态
+            q_active = data.qpos[joint_qpos_ids]
+            dq_active = data.qvel[joint_qvel_ids]
             
-            q_active = all_q[q_corr]
-            dq_active = all_dq[q_corr]
-            
+            # PD Control
             tau = cfg.robot_config.kps * (target_q - q_active) - cfg.robot_config.kds * dq_active
             tau = np.clip(tau, -cfg.robot_config.tau_limit, cfg.robot_config.tau_limit)
             
-            if not np.isnan(tau).any():
-                data.ctrl[actuator_indices] = tau
-                
-            try:
-                mujoco.mj_step(model, data)
-            except Exception as e:
-                print(f"Sim Error: {e}")
-                reset_sim()
+            if len(data.ctrl) >= 12:
+                data.ctrl[:12] = tau
+            
+            mujoco.mj_step(model, data)
 
             if count_lowlevel % 15 == 0:
                 viewer.sync()
             
             count_lowlevel += 1
-            time_until_next = model.opt.timestep - (time.time() - step_start)
-            if time_until_next > 0: time.sleep(time_until_next)
-            
-        done = True
-def init_joystick():
-    global joystick
-    pygame.joystick.init()  # 初始化手柄
-    joystick_count = pygame.joystick.get_count()
+            dt_sleep = cfg.sim_config.dt - (time.time() - step_start)
+            if dt_sleep > 0: time.sleep(dt_sleep)
 
-    if joystick_count > 0:
-        try:
-            joystick = pygame.joystick.Joystick(1)  # 连接第一个手柄
-            joystick.init()
-            print("Joystick initialized!")
-        except pygame.error as e:
-            # print(f"Failed to initialize joystick: {e}")
-            joystick = None
-    else:
-        joystick = None
-        print("No joystick detected!")
+    done = True
 
+# ===================================================================
+# 5. 手柄循环
+# ===================================================================
 def joy_loop():
-    # Keep original joystick loop structure as requested
-    global done, joystick
+    global done
     pygame.init()
-    init_joystick()
+    pygame.joystick.init()
+    js = None
     while not done:
         pygame.event.pump()
-        if joystick is None or not joystick.get_init():
-            init_joystick()
-            time.sleep(1)
-        else:
+        if pygame.joystick.get_count() > 0 and js is None:
             try:
-                for axis in range(joystick.get_numaxes()):
-                    val = joystick.get_axis(axis)
-                    joy_data.Axis[axis] = val if abs(val) > 0.05 else 0
-                for button in range(joystick.get_numbuttons()):
-                    if joystick.get_button(button):
-                        joy_data.button_last = joy_data.button
-                        joy_data.button = button
-            except:
-                joystick = None
+                js = pygame.joystick.Joystick(0)
+                js.init()
+            except: js = None
+        if js:
+            try:
+                joy_data.Axis[1] = js.get_axis(1)
+                joy_data.Axis[0] = js.get_axis(0)
+                joy_data.Axis[3] = js.get_axis(3)
+            except: js = None
         time.sleep(0.01)
 
 if __name__ == '__main__':
-    # Policy Path
-    path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-base_jit.pt"
-    print(f"Loading Policy: {path}")
-    policy = torch.jit.load(path, map_location=device)
-    
-    thread1 = threading.Thread(target=run_mujoco, args=(policy, Sim2simCfg))
-    thread2 = threading.Thread(target=joy_loop, args=())
-
-    thread1.start()
-    thread2.start()
-    thread1.join()
-    thread2.join()
+    cfg = Sim2simCfg()
+    t1 = threading.Thread(target=run_mujoco, args=(cfg,))
+    t2 = threading.Thread(target=joy_loop)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
