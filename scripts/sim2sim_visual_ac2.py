@@ -451,7 +451,6 @@ def run_mujoco(cfg: Sim2simCfg):
         
     joint_qpos_ids = np.array(joint_qpos_ids)
     joint_qvel_ids = np.array(joint_qvel_ids)
-    # -----------------------------------------------------------------------------------
 
     obs_history = CircularBuffer(cfg.sim_config.history_len, (1, cfg.sim_config.n_proprio), device)
     last_action = torch.zeros(12, device=device)
