@@ -99,6 +99,7 @@ class MockEnvCfg:
 
 class Sim2simCfg:
     class sim_config:
+        #TODO model path
         mujoco_model_path = "assets/actiger/ac2/urdf/scene_terrain.xml"
         base_jit_path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-base_jit.pt"
         vision_weight_path = "pre-trian_policy/ac2-visual-robocon_v1.2-15500-vision_weight.pt"
